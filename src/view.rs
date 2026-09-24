@@ -50,8 +50,11 @@
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
+use crate::mouse::{ScrollAction, pixel_to_cell, scroll_action};
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use gpui::{Edges, *};
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -378,6 +381,12 @@ pub struct TerminalView {
     /// The renderer for drawing terminal content
     renderer: TerminalRenderer,
 
+    /// Geometry measured by the canvas, in window coordinates.
+    geometry: Arc<parking_lot::Mutex<Option<TerminalGeometry>>>,
+
+    /// Unconsumed wheel movement in pixels, retained across trackpad events.
+    scroll_accum: f32,
+
     /// Focus handle for keyboard event handling
     focus_handle: FocusHandle,
 
@@ -411,6 +420,13 @@ pub struct TerminalView {
 
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
+}
+
+#[derive(Clone, Copy)]
+struct TerminalGeometry {
+    origin: Point<Pixels>,
+    cell_width: Pixels,
+    cell_height: Pixels,
 }
 
 impl TerminalView {
@@ -521,6 +537,8 @@ impl TerminalView {
         Self {
             state,
             renderer,
+            geometry: Arc::new(parking_lot::Mutex::new(None)),
+            scroll_accum: 0.0,
             focus_handle,
             stdin_writer,
             event_rx,
@@ -715,7 +733,7 @@ impl TerminalView {
     /// Converts GPUI keystrokes to terminal escape sequences and writes them
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
             && handler(event)
@@ -724,6 +742,18 @@ impl TerminalView {
         }
 
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
+            self.scroll_accum = 0.0;
+            let was_scrolled = self.state.with_term_mut(|term| {
+                let was_scrolled = term.grid().display_offset() > 0;
+                if was_scrolled {
+                    term.scroll_display(Scroll::Bottom);
+                }
+                was_scrolled
+            });
+            if was_scrolled {
+                cx.notify();
+            }
+
             let mut writer = self.stdin_writer.lock();
             let _ = writer.write_all(&bytes);
             let _ = writer.flush();
@@ -779,16 +809,55 @@ impl TerminalView {
 
     /// Handle scroll events.
     ///
-    /// Currently a placeholder for future scrollback support.
     fn on_scroll(
         &mut self,
-        _event: &ScrollWheelEvent,
+        event: &ScrollWheelEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement scrollback
-        // - Scroll the terminal display up/down
-        // - Send scroll reports if alternate screen is not active
+        let Some(geometry) = *self.geometry.lock() else {
+            return;
+        };
+        let cell_height: f32 = geometry.cell_height.into();
+        if cell_height <= 0.0 {
+            return;
+        }
+
+        // GPUI's positive Y delta moves content down, exposing older lines.
+        let delta: f32 = event.delta.pixel_delta(geometry.cell_height).y.into();
+        self.scroll_accum += delta;
+        let lines = (self.scroll_accum / cell_height).trunc() as i32;
+        if lines == 0 {
+            return;
+        }
+        self.scroll_accum -= lines as f32 * cell_height;
+
+        let point = pixel_to_cell(
+            event.position,
+            geometry.origin,
+            geometry.cell_width,
+            geometry.cell_height,
+        );
+        let (cols, rows) = self
+            .state
+            .with_term(|term| (term.columns(), term.screen_lines()));
+        let point = AlacPoint::new(
+            Line(point.line.0.min(rows.saturating_sub(1) as i32)),
+            Column(point.column.0.min(cols.saturating_sub(1))),
+        );
+
+        match scroll_action(lines, point, event.modifiers.shift, self.state.mode()) {
+            ScrollAction::Report(bytes) => {
+                let mut writer = self.stdin_writer.lock();
+                let _ = writer.write_all(&bytes);
+                let _ = writer.flush();
+            }
+            ScrollAction::Local(lines) => {
+                self.state
+                    .with_term_mut(|term| term.scroll_display(Scroll::Delta(lines)));
+                cx.notify();
+            }
+        }
     }
 
     /// Process pending terminal events.
@@ -918,6 +987,7 @@ impl Render for TerminalView {
         // Get terminal state and renderer for rendering
         let state_arc = self.state.term_arc();
         let renderer = self.renderer.clone();
+        let geometry = self.geometry.clone();
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
 
@@ -939,6 +1009,15 @@ impl Render for TerminalView {
                         // Measure actual cell dimensions from the font
                         let mut measured_renderer = renderer.clone();
                         measured_renderer.measure_cell(window);
+
+                        *geometry.lock() = Some(TerminalGeometry {
+                            origin: Point {
+                                x: bounds.origin.x + padding.left,
+                                y: bounds.origin.y + padding.top,
+                            },
+                            cell_width: measured_renderer.cell_width,
+                            cell_height: measured_renderer.cell_height,
+                        });
 
                         // Calculate available space after padding
                         let available_width: f32 =
