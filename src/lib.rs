@@ -286,9 +286,9 @@
 //! | Keyboard input | ✅ Full support |
 //! | Application cursor mode | ✅ Full support |
 //! | Function keys (F1-F12) | ✅ Full support |
-//! | Mouse click reporting | 🔄 Partial (framework ready) |
-//! | Mouse selection | 🔄 Planned |
-//! | Scrollback | 🔄 Planned |
+//! | Mouse click reporting | ✅ Press and release |
+//! | Mouse selection | ✅ Drag, word, line, and block selection |
+//! | Scrollback | ✅ Wheel scrolling and selection in history |
 //! | Clipboard (OSC 52) | ✅ Callback support |
 //! | Title changes (OSC 0/2) | ✅ Callback support |
 //! | Bell (BEL) | ✅ Callback support |

@@ -464,6 +464,10 @@ impl TerminalRenderer {
         let num_cols = grid.columns();
         let offset = grid.display_offset() as i32;
         let colors = term.colors();
+        let selection_range = term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(term));
 
         // Calculate default background color
         let default_bg = self.palette.resolve(
@@ -529,6 +533,37 @@ impl TerminalRenderer {
                     transparent_black(),
                     Default::default(),
                 ));
+            }
+
+            // Paint each contiguous selected span above cell backgrounds and below glyphs.
+            if let Some(range) = selection_range {
+                let mut span_start = None;
+                for col in 0..=num_cols {
+                    let selected =
+                        col < num_cols && range.contains(AlacPoint::new(line, Column(col)));
+                    if selected {
+                        span_start.get_or_insert(col);
+                    } else if let Some(start) = span_start.take() {
+                        let rect_bounds = Bounds {
+                            origin: Point {
+                                x: origin.x + self.cell_width * start as f32,
+                                y: origin.y + self.cell_height * line_idx as f32,
+                            },
+                            size: Size {
+                                width: self.cell_width * (col - start) as f32,
+                                height: self.cell_height,
+                            },
+                        };
+                        window.paint_quad(quad(
+                            rect_bounds,
+                            px(0.0),
+                            self.palette.selection(),
+                            Edges::<Pixels>::default(),
+                            transparent_black(),
+                            Default::default(),
+                        ));
+                    }
+                }
             }
 
             // Calculate vertical offset to center text in cell

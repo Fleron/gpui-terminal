@@ -50,12 +50,20 @@
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
-use crate::mouse::{ScrollAction, pixel_to_cell, scroll_action};
+use crate::mouse::{
+    ScrollAction, encode_modifiers, mouse_button_report, pixel_to_cell, scroll_action,
+};
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
-use gpui::{Edges, *};
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::TermMode;
+use gpui::{
+    AsyncApp, Bounds, Context, Edges, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollWheelEvent, Styled, Task, WeakEntity, Window, canvas, div, px, rgb,
+};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -387,6 +395,15 @@ pub struct TerminalView {
     /// Unconsumed wheel movement in pixels, retained across trackpad events.
     scroll_accum: f32,
 
+    /// Window position of the current left-button press.
+    drag_origin: Option<Point<Pixels>>,
+
+    /// Whether a drag or multiple click has started a selection.
+    selecting: bool,
+
+    /// Whether the current left-button press was sent to a mouse-aware application.
+    reporting_mouse_down: bool,
+
     /// Focus handle for keyboard event handling
     focus_handle: FocusHandle,
 
@@ -427,6 +444,45 @@ struct TerminalGeometry {
     origin: Point<Pixels>,
     cell_width: Pixels,
     cell_height: Pixels,
+}
+
+/// Hit test a window position against the visible grid, including scrollback.
+fn hit_cell(
+    position: Point<Pixels>,
+    geometry: TerminalGeometry,
+    cols: usize,
+    rows: usize,
+    display_offset: usize,
+) -> (AlacPoint, Side) {
+    let x = (position.x - geometry.origin.x) / geometry.cell_width;
+    let y = (position.y - geometry.origin.y) / geometry.cell_height;
+    let last_col = cols.saturating_sub(1);
+    let last_row = rows.saturating_sub(1);
+
+    if y >= rows as f32 {
+        return (
+            AlacPoint::new(
+                Line(last_row as i32 - display_offset as i32),
+                Column(last_col),
+            ),
+            Side::Right,
+        );
+    }
+
+    let col = (x.floor().max(0.0) as usize).min(last_col);
+    let row = (y.floor().max(0.0) as usize).min(last_row);
+    let side = if y < 0.0 || x < 0.0 {
+        Side::Left
+    } else if x >= cols as f32 || x.fract() >= 0.5 {
+        Side::Right
+    } else {
+        Side::Left
+    };
+
+    (
+        AlacPoint::new(Line(row as i32 - display_offset as i32), Column(col)),
+        side,
+    )
 }
 
 impl TerminalView {
@@ -544,6 +600,9 @@ impl TerminalView {
             renderer,
             geometry: Arc::new(parking_lot::Mutex::new(None)),
             scroll_accum: 0.0,
+            drag_origin: None,
+            selecting: false,
+            reporting_mouse_down: false,
             focus_handle,
             stdin_writer,
             event_rx,
@@ -743,21 +802,14 @@ impl TerminalView {
         if let Some(ref handler) = self.key_handler
             && handler(event)
         {
+            if !event.keystroke.modifiers.platform {
+                self.scroll_to_bottom_and_clear_selection(cx);
+            }
             return; // Event consumed by handler
         }
 
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
-            self.scroll_accum = 0.0;
-            let was_scrolled = self.state.with_term_mut(|term| {
-                let was_scrolled = term.grid().display_offset() > 0;
-                if was_scrolled {
-                    term.scroll_display(Scroll::Bottom);
-                }
-                was_scrolled
-            });
-            if was_scrolled {
-                cx.notify();
-            }
+            self.scroll_to_bottom_and_clear_selection(cx);
 
             let mut writer = self.stdin_writer.lock();
             let _ = writer.write_all(&bytes);
@@ -765,51 +817,186 @@ impl TerminalView {
         }
     }
 
-    /// Handle mouse down events.
-    ///
-    /// Currently a placeholder for future mouse selection and interaction support.
+    /// Focus the view, report mouse input to applications, or begin a selection.
     fn on_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Request focus when clicking the terminal
         window.focus(&self.focus_handle);
+        let Some(geometry) = *self.geometry.lock() else {
+            return;
+        };
+        let mode = self.state.mode();
+        let (cols, rows, offset) = self.state.with_term(|term| {
+            (
+                term.columns(),
+                term.screen_lines(),
+                term.grid().display_offset(),
+            )
+        });
+
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            self.drag_origin = None;
+            self.selecting = false;
+            self.reporting_mouse_down = true;
+            let (point, _) = hit_cell(event.position, geometry, cols, rows, 0);
+            self.send_mouse_button(true, point, event.modifiers, mode);
+            cx.notify();
+            return;
+        }
+
+        self.reporting_mouse_down = false;
+        let (point, side) = hit_cell(event.position, geometry, cols, rows, offset);
+        self.drag_origin = Some(event.position);
+        self.selecting = false;
+        self.state.with_term_mut(|term| {
+            if event.click_count >= 2 {
+                let ty = if event.click_count == 2 {
+                    SelectionType::Semantic
+                } else {
+                    SelectionType::Lines
+                };
+                term.selection = Some(Selection::new(ty, point, side));
+                self.selecting = true;
+            } else if event.modifiers.shift
+                && let Some(selection) = term.selection.as_mut()
+            {
+                selection.update(point, side);
+                self.selecting = true;
+            } else {
+                term.selection = None;
+            }
+        });
         cx.notify();
-
-        // TODO: Implement mouse selection
-        // - Convert pixel coordinates to cell coordinates
-        // - Start selection at clicked cell
-        // - Send mouse reports if mouse tracking is enabled
     }
 
-    /// Handle mouse up events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
-    fn on_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO: Implement mouse selection
-        // - End selection at released cell
-        // - Copy selection to clipboard if configured
+    /// Finalize a selection or report a mouse release.
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let was_selecting = self.selecting;
+        let had_drag_origin = self.drag_origin.take().is_some();
+        let was_reporting = std::mem::replace(&mut self.reporting_mouse_down, false);
+        self.selecting = false;
+
+        if was_reporting {
+            let mode = self.state.mode();
+            if mode.intersects(TermMode::MOUSE_MODE)
+                && let Some(geometry) = *self.geometry.lock()
+            {
+                let (cols, rows) = self
+                    .state
+                    .with_term(|term| (term.columns(), term.screen_lines()));
+                let (point, _) = hit_cell(event.position, geometry, cols, rows, 0);
+                self.send_mouse_button(false, point, event.modifiers, mode);
+            }
+            cx.notify();
+            return;
+        }
+        if !had_drag_origin {
+            return;
+        }
+
+        if was_selecting && let Some(geometry) = *self.geometry.lock() {
+            self.state.with_term_mut(|term| {
+                let (point, side) = hit_cell(
+                    event.position,
+                    geometry,
+                    term.columns(),
+                    term.screen_lines(),
+                    term.grid().display_offset(),
+                );
+                if let Some(selection) = term.selection.as_mut() {
+                    selection.update(point, side);
+                }
+            });
+        }
+        self.state.with_term_mut(|term| {
+            if term.selection.as_ref().is_some_and(Selection::is_empty) {
+                term.selection = None;
+            }
+        });
+        cx.notify();
     }
 
-    /// Handle mouse move events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
+    /// Update the selection once the left-button drag passes two pixels.
     fn on_mouse_move(
         &mut self,
-        _event: &MouseMoveEvent,
+        event: &MouseMoveEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - Update selection range while dragging
-        // - Send mouse motion reports if mouse tracking is enabled
+        let Some(origin) = self.drag_origin else {
+            return;
+        };
+        if !event.dragging() {
+            return;
+        }
+        let Some(geometry) = *self.geometry.lock() else {
+            return;
+        };
+        let allow_scroll = !self.state.mode().contains(TermMode::ALT_SCREEN);
+
+        if !self.selecting {
+            let dx: f32 = (event.position.x - origin.x).into();
+            let dy: f32 = (event.position.y - origin.y).into();
+            if dx * dx + dy * dy < 4.0 {
+                return;
+            }
+        }
+
+        self.state.with_term_mut(|term| {
+            let cols = term.columns();
+            let rows = term.screen_lines();
+            if !self.selecting {
+                let offset = term.grid().display_offset();
+                let (point, side) = hit_cell(origin, geometry, cols, rows, offset);
+                let ty = if event.modifiers.alt {
+                    SelectionType::Block
+                } else {
+                    SelectionType::Simple
+                };
+                term.selection = Some(Selection::new(ty, point, side));
+                self.selecting = true;
+            }
+            if allow_scroll {
+                let grid_top = geometry.origin.y;
+                let grid_bottom = grid_top + geometry.cell_height * rows as f32;
+                let overshoot = if event.position.y < grid_top {
+                    (grid_top - event.position.y) / geometry.cell_height
+                } else if event.position.y >= grid_bottom {
+                    (grid_bottom - event.position.y) / geometry.cell_height
+                } else {
+                    0.0
+                };
+                if overshoot != 0.0 {
+                    let lines = (overshoot.abs().round() as i32).clamp(1, 3);
+                    term.scroll_display(Scroll::Delta(lines * overshoot.signum() as i32));
+                }
+            }
+            let offset = term.grid().display_offset();
+            let (point, side) = hit_cell(event.position, geometry, cols, rows, offset);
+            if let Some(selection) = term.selection.as_mut() {
+                selection.update(point, side);
+            }
+        });
+        cx.notify();
+    }
+
+    fn send_mouse_button(
+        &self,
+        pressed: bool,
+        point: AlacPoint,
+        modifiers: Modifiers,
+        mode: TermMode,
+    ) {
+        let modifiers = encode_modifiers(modifiers.shift, modifiers.alt, modifiers.control);
+        if let Some(bytes) = mouse_button_report(MouseButton::Left, pressed, point, modifiers, mode)
+        {
+            let mut writer = self.stdin_writer.lock();
+            let _ = writer.write_all(&bytes);
+            let _ = writer.flush();
+        }
     }
 
     /// Handle scroll events.
@@ -914,6 +1101,43 @@ impl TerminalView {
         (self.state.cols(), self.state.rows())
     }
 
+    /// Return the selected terminal text, if the selection contains text.
+    pub fn selection_text(&self) -> Option<String> {
+        self.state
+            .with_term(|term| term.selection_to_string().filter(|text| !text.is_empty()))
+    }
+
+    /// Whether there is text available to copy from the selection.
+    pub fn has_selection(&self) -> bool {
+        self.selection_text().is_some()
+    }
+
+    /// Clear the selection and repaint if needed.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if self
+            .state
+            .with_term_mut(|term| term.selection.take().is_some())
+        {
+            cx.notify();
+        }
+    }
+
+    /// Return to live output and clear the selection before sending input.
+    pub fn scroll_to_bottom_and_clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.scroll_accum = 0.0;
+        let changed = self.state.with_term_mut(|term| {
+            let was_scrolled = term.grid().display_offset() > 0;
+            if was_scrolled {
+                term.scroll_display(Scroll::Bottom);
+            }
+            let had_selection = term.selection.take().is_some();
+            was_scrolled || had_selection
+        });
+        if changed {
+            cx.notify();
+        }
+    }
+
     /// Resize the terminal to new dimensions.
     ///
     /// This method should be called when the terminal view size changes.
@@ -995,6 +1219,8 @@ impl Render for TerminalView {
         let geometry = self.geometry.clone();
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
+        let entity = cx.entity();
+        let tracking_pointer = self.drag_origin.is_some() || self.reporting_mouse_down;
 
         div()
             .size_full()
@@ -1010,6 +1236,34 @@ impl Render for TerminalView {
                     move |bounds, _window, _cx| bounds,
                     move |bounds, _, window, cx| {
                         use alacritty_terminal::grid::Dimensions;
+
+                        if tracking_pointer {
+                            let move_entity = entity.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseMoveEvent, phase, window, cx| {
+                                    if phase == gpui::DispatchPhase::Bubble
+                                        && event.dragging()
+                                        && !bounds.contains(&event.position)
+                                    {
+                                        move_entity.update(cx, |view, cx| {
+                                            view.on_mouse_move(event, window, cx)
+                                        });
+                                    }
+                                },
+                            );
+                            window.on_mouse_event(
+                                move |event: &MouseUpEvent, phase, window, cx| {
+                                    if phase == gpui::DispatchPhase::Bubble
+                                        && event.button == MouseButton::Left
+                                        && !bounds.contains(&event.position)
+                                    {
+                                        entity.update(cx, |view, cx| {
+                                            view.on_mouse_up(event, window, cx)
+                                        });
+                                    }
+                                },
+                            );
+                        }
 
                         // Measure actual cell dimensions from the font
                         let mut measured_renderer = renderer.clone();
@@ -1082,5 +1336,76 @@ impl Render for TerminalView {
     }
 }
 
-// Tests are omitted due to macro expansion issues with the test attribute
-// in this configuration. Integration tests can be added separately.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::point;
+
+    fn geometry() -> TerminalGeometry {
+        TerminalGeometry {
+            origin: point(px(10.0), px(20.0)),
+            cell_width: px(10.0),
+            cell_height: px(20.0),
+        }
+    }
+
+    #[test]
+    fn hit_cell_uses_cell_half_and_visible_row() {
+        assert_eq!(
+            hit_cell(point(px(34.0), px(45.0)), geometry(), 8, 4, 0),
+            (AlacPoint::new(Line(1), Column(2)), Side::Left)
+        );
+        assert_eq!(
+            hit_cell(point(px(36.0), px(45.0)), geometry(), 8, 4, 0),
+            (AlacPoint::new(Line(1), Column(2)), Side::Right)
+        );
+    }
+
+    #[test]
+    fn hit_cell_clamps_outside_grid() {
+        assert_eq!(
+            hit_cell(point(px(34.0), px(10.0)), geometry(), 8, 4, 0),
+            (AlacPoint::new(Line(0), Column(2)), Side::Left)
+        );
+        assert_eq!(
+            hit_cell(point(px(5.0), px(45.0)), geometry(), 8, 4, 0),
+            (AlacPoint::new(Line(1), Column(0)), Side::Left)
+        );
+        assert_eq!(
+            hit_cell(point(px(100.0), px(45.0)), geometry(), 8, 4, 0),
+            (AlacPoint::new(Line(1), Column(7)), Side::Right)
+        );
+        assert_eq!(
+            hit_cell(point(px(34.0), px(105.0)), geometry(), 8, 4, 0),
+            (AlacPoint::new(Line(3), Column(7)), Side::Right)
+        );
+    }
+
+    #[test]
+    fn hit_cell_maps_visible_rows_into_scrollback() {
+        assert_eq!(
+            hit_cell(point(px(11.0), px(21.0)), geometry(), 8, 4, 5),
+            (AlacPoint::new(Line(-5), Column(0)), Side::Left)
+        );
+    }
+
+    #[test]
+    fn selection_in_scrollback_follows_new_output() {
+        let (tx, _rx) = mpsc::channel();
+        let mut state = TerminalState::new_with_scrollback(8, 3, 10, GpuiEventProxy::new(tx));
+        state.process_bytes(b"alpha\r\nbravo\r\ncharlie\r\n");
+        state.with_term_mut(|term| {
+            term.scroll_display(Scroll::Delta(1));
+            let offset = term.grid().display_offset();
+            let (start, side) = hit_cell(point(px(11.0), px(21.0)), geometry(), 8, 3, offset);
+            let (end, end_side) = hit_cell(point(px(59.0), px(21.0)), geometry(), 8, 3, offset);
+            let mut selection = Selection::new(SelectionType::Simple, start, side);
+            selection.update(end, end_side);
+            term.selection = Some(selection);
+            assert_eq!(term.selection_to_string().as_deref(), Some("alpha"));
+        });
+
+        state.process_bytes(b"delta\r\n");
+        state.with_term(|term| assert_eq!(term.selection_to_string().as_deref(), Some("alpha")));
+    }
+}
