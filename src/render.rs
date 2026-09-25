@@ -462,6 +462,7 @@ impl TerminalRenderer {
         let grid = term.grid();
         let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
+        let offset = grid.display_offset() as i32;
         let colors = term.colors();
 
         // Calculate default background color
@@ -488,7 +489,7 @@ impl TerminalRenderer {
 
         // Iterate over visible lines
         for line_idx in 0..num_lines {
-            let line = Line(line_idx as i32);
+            let line = Line(line_idx as i32 - offset);
 
             // Collect cells for this line
             let cells: Vec<(usize, Cell)> = (0..num_cols)
@@ -543,7 +544,8 @@ impl TerminalRenderer {
 
             // First pass: find and draw horizontal spans of box-drawing characters
             // This draws continuous lines across multiple cells to avoid gaps
-            let mut processed_horizontal: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut processed_horizontal: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
 
             let mut i = 0;
             while i < cells_vec.len() {
@@ -712,6 +714,11 @@ impl TerminalRenderer {
                 // Paint at exact cell position (ignore errors)
                 let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
             }
+        }
+
+        // The live cursor has no position in a scrolled viewport.
+        if offset > 0 {
+            return;
         }
 
         // Paint cursor

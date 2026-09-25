@@ -363,6 +363,27 @@ pub fn scroll_report(
     None
 }
 
+/// Whether a wheel event should be sent to the terminal application or scroll history.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScrollAction {
+    /// Bytes to send to the terminal application.
+    Report(Vec<u8>),
+    /// Number of lines to scroll in the terminal's history.
+    Local(i32),
+}
+
+/// Choose wheel behavior from the terminal mode, with Shift overriding mouse capture.
+pub fn scroll_action(lines: i32, point: AlacPoint, shift: bool, mode: TermMode) -> ScrollAction {
+    if shift {
+        return ScrollAction::Local(lines);
+    }
+
+    match scroll_report(lines, point, 0, mode) {
+        Some(bytes) => ScrollAction::Report(bytes),
+        None => ScrollAction::Local(lines),
+    }
+}
+
 /// Convert scroll delta to arrow key sequences.
 ///
 /// This is used when an application is in alternate screen mode (like vim or less)
@@ -667,6 +688,33 @@ mod tests {
         // In normal screen mode, scrolling should be handled locally
         let bytes = scroll_report(3, point, 0, mode);
         assert!(bytes.is_none());
+    }
+
+    #[test]
+    fn test_scroll_action() {
+        let point = AlacPoint::new(Line(5), Column(10));
+
+        assert_eq!(
+            scroll_action(2, point, false, TermMode::empty()),
+            ScrollAction::Local(2)
+        );
+        assert_eq!(
+            scroll_action(-2, point, false, TermMode::MOUSE_REPORT_CLICK),
+            ScrollAction::Report(b"\x1b[<65;11;6M".to_vec()),
+        );
+        assert_eq!(
+            scroll_action(
+                2,
+                point,
+                false,
+                TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL
+            ),
+            ScrollAction::Report(b"\x1b[A\x1b[A".to_vec()),
+        );
+        assert_eq!(
+            scroll_action(2, point, true, TermMode::MOUSE_REPORT_CLICK),
+            ScrollAction::Local(2),
+        );
     }
 
     #[test]
