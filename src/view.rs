@@ -51,7 +51,8 @@ use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::mouse::{
-    ScrollAction, encode_modifiers, mouse_button_report, pixel_to_cell, scroll_action,
+    ScrollAction, encode_modifiers, mouse_button_report, mouse_motion_report, pixel_to_cell,
+    scroll_action,
 };
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
@@ -404,6 +405,9 @@ pub struct TerminalView {
     /// Whether the current left-button press was sent to a mouse-aware application.
     reporting_mouse_down: bool,
 
+    /// Last grid cell sent in a mouse motion report.
+    last_reported_cell: Option<AlacPoint>,
+
     /// Focus handle for keyboard event handling
     focus_handle: FocusHandle,
 
@@ -603,6 +607,7 @@ impl TerminalView {
             drag_origin: None,
             selecting: false,
             reporting_mouse_down: false,
+            last_reported_cell: None,
             focus_handle,
             stdin_writer,
             event_rx,
@@ -825,6 +830,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        self.last_reported_cell = None;
         let Some(geometry) = *self.geometry.lock() else {
             return;
         };
@@ -874,6 +880,7 @@ impl TerminalView {
 
     /// Finalize a selection or report a mouse release.
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.last_reported_cell = None;
         let was_selecting = self.selecting;
         let had_drag_origin = self.drag_origin.take().is_some();
         let was_reporting = std::mem::replace(&mut self.reporting_mouse_down, false);
@@ -926,6 +933,26 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reporting_mouse_down {
+            if event.dragging()
+                && self
+                    .state
+                    .mode()
+                    .intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+            {
+                self.send_mouse_motion(Some(MouseButton::Left), event);
+            }
+            return;
+        }
+        if self.drag_origin.is_none()
+            && !event.dragging()
+            && !event.modifiers.shift
+            && self.state.mode().contains(TermMode::MOUSE_MOTION)
+        {
+            self.send_mouse_motion(None, event);
+            return;
+        }
+
         let Some(origin) = self.drag_origin else {
             return;
         };
@@ -993,6 +1020,33 @@ impl TerminalView {
         let modifiers = encode_modifiers(modifiers.shift, modifiers.alt, modifiers.control);
         if let Some(bytes) = mouse_button_report(MouseButton::Left, pressed, point, modifiers, mode)
         {
+            let mut writer = self.stdin_writer.lock();
+            let _ = writer.write_all(&bytes);
+            let _ = writer.flush();
+        }
+    }
+
+    fn send_mouse_motion(&mut self, pressed_button: Option<MouseButton>, event: &MouseMoveEvent) {
+        let Some(geometry) = *self.geometry.lock() else {
+            return;
+        };
+        let mode = self.state.mode();
+        let (cols, rows) = self
+            .state
+            .with_term(|term| (term.columns(), term.screen_lines()));
+        let (point, _) = hit_cell(event.position, geometry, cols, rows, 0);
+        let modifiers = encode_modifiers(
+            event.modifiers.shift,
+            event.modifiers.alt,
+            event.modifiers.control,
+        );
+        if let Some(bytes) = mouse_motion_report(
+            pressed_button,
+            point,
+            modifiers,
+            mode,
+            &mut self.last_reported_cell,
+        ) {
             let mut writer = self.stdin_writer.lock();
             let _ = writer.write_all(&bytes);
             let _ = writer.flush();

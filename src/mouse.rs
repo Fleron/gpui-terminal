@@ -41,7 +41,7 @@
 //! | Mode | Description |
 //! |------|-------------|
 //! | `MOUSE_REPORT_CLICK` | Report button press/release |
-//! | `MOUSE_MOTION` | Report motion while buttons held |
+//! | `MOUSE_MOTION` | Report motion with or without a button held |
 //! | `MOUSE_DRAG` | Report motion during drag |
 //! | `ALT_SCREEN` | Alternate screen (vim, less, etc.) |
 //!
@@ -200,6 +200,39 @@ pub fn mouse_button_report(
 
     let sequence = format!("\x1b[<{};{};{}{}", button_value, col, row, action as char);
     Some(sequence.into_bytes())
+}
+
+/// Generate an SGR motion report when the pointer enters a different cell.
+///
+/// A held left button uses code 32. Motion without a button uses code 35 and
+/// is reported only in `MOUSE_MOTION` mode. The caller resets `last_reported_cell`
+/// when the button state changes.
+pub(crate) fn mouse_motion_report(
+    pressed_button: Option<MouseButton>,
+    point: AlacPoint,
+    modifiers: u8,
+    mode: TermMode,
+    last_reported_cell: &mut Option<AlacPoint>,
+) -> Option<Vec<u8>> {
+    let button_code = match pressed_button {
+        Some(MouseButton::Left)
+            if mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) =>
+        {
+            32
+        }
+        None if mode.contains(TermMode::MOUSE_MOTION) => 35,
+        _ => return None,
+    };
+
+    if *last_reported_cell == Some(point) {
+        return None;
+    }
+    *last_reported_cell = Some(point);
+
+    let button_value = button_code | modifiers;
+    let col = point.column.0 + 1;
+    let row = point.line.0 + 1;
+    Some(format!("\x1b[<{button_value};{col};{row}M").into_bytes())
 }
 
 /// Generate scroll wheel report escape sequence.
@@ -491,6 +524,84 @@ mod tests {
 
         let bytes = mouse_button_report(MouseButton::Left, true, point, 0, mode);
         assert!(bytes.is_none());
+    }
+
+    #[test]
+    fn test_mouse_drag_report_once_per_cell() {
+        let point = AlacPoint::new(Line(5), Column(10));
+        let mode = TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE;
+        let mut last_reported_cell = None;
+
+        let first = mouse_motion_report(
+            Some(MouseButton::Left),
+            point,
+            0,
+            mode,
+            &mut last_reported_cell,
+        );
+        assert_eq!(first.as_deref(), Some(b"\x1b[<32;11;6M".as_slice()));
+        assert_eq!(
+            mouse_motion_report(
+                Some(MouseButton::Left),
+                point,
+                0,
+                mode,
+                &mut last_reported_cell
+            ),
+            None
+        );
+
+        let next = AlacPoint::new(Line(5), Column(11));
+        let report = mouse_motion_report(
+            Some(MouseButton::Left),
+            next,
+            8,
+            mode,
+            &mut last_reported_cell,
+        );
+        assert_eq!(report.as_deref(), Some(b"\x1b[<40;12;6M".as_slice()));
+    }
+
+    #[test]
+    fn test_mouse_motion_modes() {
+        let point = AlacPoint::new(Line(0), Column(0));
+        let mut last_reported_cell = None;
+        let click_mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(
+            mouse_motion_report(
+                Some(MouseButton::Left),
+                point,
+                0,
+                click_mode,
+                &mut last_reported_cell
+            ),
+            None
+        );
+        assert_eq!(
+            mouse_motion_report(
+                None,
+                point,
+                0,
+                TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE,
+                &mut last_reported_cell
+            ),
+            None
+        );
+        assert_eq!(last_reported_cell, None);
+
+        let motion_mode = TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE;
+        let report = mouse_motion_report(None, point, 0, motion_mode, &mut last_reported_cell);
+        assert_eq!(report.as_deref(), Some(b"\x1b[<35;1;1M".as_slice()));
+
+        last_reported_cell = None;
+        let report = mouse_motion_report(
+            Some(MouseButton::Left),
+            point,
+            0,
+            motion_mode,
+            &mut last_reported_cell,
+        );
+        assert_eq!(report.as_deref(), Some(b"\x1b[<32;1;1M".as_slice()));
     }
 
     #[test]
