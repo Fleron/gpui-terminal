@@ -108,6 +108,9 @@ pub struct ColorPalette {
 
     /// Default cursor color
     cursor: Hsla,
+
+    /// Translucent text selection highlight
+    selection: Hsla,
 }
 
 impl Default for ColorPalette {
@@ -246,6 +249,7 @@ impl Default for ColorPalette {
             g: 0xff,
             b: 0xff,
         }); // White
+        let selection = Hsla { a: 0.35, ..cursor };
 
         Self {
             ansi_colors,
@@ -253,11 +257,17 @@ impl Default for ColorPalette {
             foreground,
             background,
             cursor,
+            selection,
         }
     }
 }
 
 impl ColorPalette {
+    /// Color used to highlight selected cells.
+    pub fn selection(&self) -> Hsla {
+        self.selection
+    }
+
     /// Creates a new color palette with default colors.
     pub fn new() -> Self {
         Self::default()
@@ -449,6 +459,7 @@ fn rgb_to_hsla(rgb: Rgb) -> Hsla {
 #[derive(Debug, Clone)]
 pub struct ColorPaletteBuilder {
     palette: ColorPalette,
+    selection: Option<Hsla>,
 }
 
 impl Default for ColorPaletteBuilder {
@@ -462,6 +473,7 @@ impl ColorPaletteBuilder {
     pub fn new() -> Self {
         Self {
             palette: ColorPalette::default(),
+            selection: None,
         }
     }
 
@@ -480,6 +492,12 @@ impl ColorPaletteBuilder {
     /// Sets the cursor color.
     pub fn cursor(mut self, r: u8, g: u8, b: u8) -> Self {
         self.palette.cursor = rgb_to_hsla(Rgb { r, g, b });
+        self
+    }
+
+    /// Sets the selection highlight color. The resulting highlight uses 35% opacity.
+    pub fn selection(mut self, r: u8, g: u8, b: u8) -> Self {
+        self.selection = Some(rgb_to_hsla(Rgb { r, g, b }));
         self
     }
 
@@ -587,7 +605,11 @@ impl ColorPaletteBuilder {
     }
 
     /// Builds the color palette.
-    pub fn build(self) -> ColorPalette {
+    pub fn build(mut self) -> ColorPalette {
+        self.palette.selection = Hsla {
+            a: 0.35,
+            ..self.selection.unwrap_or(self.palette.cursor)
+        };
         self.palette
     }
 }
@@ -632,6 +654,38 @@ mod tests {
         let palette = ColorPalette::default();
         assert_eq!(palette.ansi_colors.len(), 16);
         assert_eq!(palette.extended_colors.len(), 256);
+        assert_eq!(
+            palette.selection(),
+            Hsla {
+                a: 0.35,
+                ..palette.cursor
+            }
+        );
+    }
+
+    #[test]
+    fn test_selection_color_uses_builder_color_and_alpha() {
+        let palette = ColorPalette::builder().selection(0x30, 0x60, 0x90).build();
+        assert_eq!(
+            palette.selection(),
+            Hsla {
+                a: 0.35,
+                ..rgb_to_hsla(Rgb {
+                    r: 0x30,
+                    g: 0x60,
+                    b: 0x90
+                })
+            }
+        );
+
+        let palette = ColorPalette::builder().cursor(0x30, 0x60, 0x90).build();
+        assert_eq!(
+            palette.selection(),
+            Hsla {
+                a: 0.35,
+                ..palette.cursor
+            }
+        );
     }
 
     #[test]

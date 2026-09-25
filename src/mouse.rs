@@ -5,7 +5,6 @@
 //! - [`pixel_to_cell`]: Convert pixel coordinates to grid coordinates
 //! - [`mouse_button_report`]: Generate SGR mouse report sequences
 //! - [`scroll_report`]: Handle scroll wheel events
-//! - [`Selection`]: Text selection data structure
 //!
 //! # Mouse Reporting (SGR 1006)
 //!
@@ -77,71 +76,6 @@ use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::term::TermMode;
 use gpui::{MouseButton, Pixels, Point};
 
-/// Type of text selection in the terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectionType {
-    /// Character-by-character selection (single click).
-    Simple,
-    /// Word-based selection (double click).
-    Word,
-    /// Line-based selection (triple click).
-    Line,
-}
-
-/// Represents a text selection in the terminal.
-///
-/// A selection has a start and end point in the terminal grid.
-/// The selection is inclusive of both endpoints.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Selection {
-    /// The starting point of the selection.
-    pub start: AlacPoint,
-    /// The ending point of the selection.
-    pub end: AlacPoint,
-    /// The type of selection (character, word, or line).
-    pub selection_type: SelectionType,
-}
-
-impl Selection {
-    /// Create a new selection.
-    ///
-    /// # Arguments
-    ///
-    /// * `start` - The starting point of the selection
-    /// * `end` - The ending point of the selection
-    /// * `selection_type` - The type of selection
-    ///
-    /// # Returns
-    ///
-    /// A new `Selection` instance.
-    pub fn new(start: AlacPoint, end: AlacPoint, selection_type: SelectionType) -> Self {
-        Self {
-            start,
-            end,
-            selection_type,
-        }
-    }
-
-    /// Check if a point is within the selection.
-    ///
-    /// # Arguments
-    ///
-    /// * `point` - The point to check
-    ///
-    /// # Returns
-    ///
-    /// `true` if the point is within the selection, `false` otherwise.
-    pub fn contains(&self, point: AlacPoint) -> bool {
-        let (start, end) = if self.start < self.end {
-            (self.start, self.end)
-        } else {
-            (self.end, self.start)
-        };
-
-        point >= start && point <= end
-    }
-}
-
 /// Convert pixel position to terminal grid coordinates.
 ///
 /// This function transforms a pixel coordinate (e.g., from a mouse event) into
@@ -187,37 +121,6 @@ pub fn pixel_to_cell(
     let row = row.max(0.0) as i32;
 
     AlacPoint::new(Line(row), Column(col))
-}
-
-/// Determine the selection type based on the number of clicks.
-///
-/// # Arguments
-///
-/// * `click_count` - The number of consecutive clicks
-///
-/// # Returns
-///
-/// The corresponding `SelectionType`:
-/// - 1 click: `SelectionType::Simple`
-/// - 2 clicks: `SelectionType::Word`
-/// - 3 or more clicks: `SelectionType::Line`
-///
-/// # Examples
-///
-/// ```
-/// use gpui_terminal::mouse::{selection_type_from_clicks, SelectionType};
-///
-/// assert_eq!(selection_type_from_clicks(1), SelectionType::Simple);
-/// assert_eq!(selection_type_from_clicks(2), SelectionType::Word);
-/// assert_eq!(selection_type_from_clicks(3), SelectionType::Line);
-/// assert_eq!(selection_type_from_clicks(4), SelectionType::Line);
-/// ```
-pub fn selection_type_from_clicks(click_count: usize) -> SelectionType {
-    match click_count {
-        1 => SelectionType::Simple,
-        2 => SelectionType::Word,
-        _ => SelectionType::Line,
-    }
 }
 
 /// Generate mouse button report escape sequence for SGR mode.
@@ -537,50 +440,6 @@ mod tests {
         let point = pixel_to_cell(position, origin, cell_width, cell_height);
         assert_eq!(point.column.0, 0);
         assert_eq!(point.line.0, 0);
-    }
-
-    #[test]
-    fn test_selection_type_from_clicks() {
-        assert_eq!(selection_type_from_clicks(1), SelectionType::Simple);
-        assert_eq!(selection_type_from_clicks(2), SelectionType::Word);
-        assert_eq!(selection_type_from_clicks(3), SelectionType::Line);
-        assert_eq!(selection_type_from_clicks(4), SelectionType::Line);
-        assert_eq!(selection_type_from_clicks(10), SelectionType::Line);
-    }
-
-    #[test]
-    fn test_selection_contains() {
-        let selection = Selection::new(
-            AlacPoint::new(Line(5), Column(10)),
-            AlacPoint::new(Line(7), Column(20)),
-            SelectionType::Simple,
-        );
-
-        // Point within selection
-        assert!(selection.contains(AlacPoint::new(Line(6), Column(15))));
-
-        // Start and end points
-        assert!(selection.contains(AlacPoint::new(Line(5), Column(10))));
-        assert!(selection.contains(AlacPoint::new(Line(7), Column(20))));
-
-        // Points outside selection
-        assert!(!selection.contains(AlacPoint::new(Line(4), Column(15))));
-        assert!(!selection.contains(AlacPoint::new(Line(8), Column(15))));
-    }
-
-    #[test]
-    fn test_selection_contains_reverse() {
-        // Test with end < start (reversed selection)
-        let selection = Selection::new(
-            AlacPoint::new(Line(7), Column(20)),
-            AlacPoint::new(Line(5), Column(10)),
-            SelectionType::Simple,
-        );
-
-        // Should still work correctly
-        assert!(selection.contains(AlacPoint::new(Line(6), Column(15))));
-        assert!(selection.contains(AlacPoint::new(Line(5), Column(10))));
-        assert!(selection.contains(AlacPoint::new(Line(7), Column(20))));
     }
 
     #[test]
